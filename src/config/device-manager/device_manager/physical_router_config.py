@@ -64,15 +64,20 @@ class PhysicalRouterConfig(object):
     			    self.__class__ = subclass
     # end update
 
-    def send_netconf(self, new_config, default_operation="merge", operation="replace"):
+    def _supported(self):
         if (self.vendor is None or self.product is None or
-               self.vendor.lower() != self._vendor or self.product.lower() != self._product):
+            self.vendor.lower() != self._vendor or self.product.lower() != self._product):
             self._logger.info("auto configuraion of physical router is not supported \
                 on the configured vendor family, ip: %s, not pushing netconf message" % (self.management_ip))
-            return
+            return False
         if (self.vnc_managed is None or self.vnc_managed == False):
             self._logger.info("vnc managed property must be set for a physical router to get auto \
                 configured, ip: %s, not pushing netconf message" % (self.management_ip))
+            return False
+        return True
+
+    def send_netconf(self, new_config, default_operation="merge", operation="replace"):
+        if not self._supported:
             return
 
         try:
@@ -561,9 +566,45 @@ class PhysicalRouterConfig(object):
 
 # end PhycalRouterConfig
 
+
 class AluXrsConfig(PhysicalRouterConfig):
     """Subclass for physical router configutation implementing methods for
     Alcatel Lucent XRS routers.
     """
     _vendor = "alcatel"
     _product = "xrs"
+
+    def send_netconf(self, new_config, default_operation="merge", operation="replace"):
+        if not self._supported:
+            return
+
+        try:
+            with manager.connect(host=self.management_ip, port=830,
+                                 username=self.user_creds['username'],
+                                 password=self.user_creds['password'],
+                                 unknown_host_cb=lambda x, y: True,
+                                 device_params={'name': "alu"}) as m:
+                assert(":validate" in m.server_capabilities)
+
+                add_config = etree.Element(
+                    "config",
+                    nsmap={"xc": "urn:ietf:params:xml:ns:netconf:base:1.0"})
+                config = etree.SubElement(add_config, "configure",
+                    nsmap={"xc": "alcatel"})
+
+                #
+                # config foobar
+                #
+
+                self._logger.info("\nsend netconf message: %s\n" % (etree.tostring(add_config, pretty_print=True)))
+                m.edit_config(
+                    target='running', config=etree.tostring(add_config),
+                    test_option='test-then-set')
+
+        except Exception as e:
+            if self._logger:
+                self._logger.error("Router %s: %s" % (self.management_ip,
+                                                      e.message))
+    # end send_config
+
+# end AluXrsConfig
