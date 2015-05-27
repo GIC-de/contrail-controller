@@ -1,7 +1,6 @@
 #
 # Copyright (c) 2014 Juniper Networks, Inc. All rights reserved.
 #
-
 """
 This file contains implementation of inetconf interface for physical router
 configuration manager
@@ -12,6 +11,19 @@ from ncclient import manager
 import copy
 
 class PhysicalRouterConfig(object):
+    """Parent class for physical router configutation implementing methods for
+    Juniper MX routers.
+
+    Introducing new vendors or products means creating a new class inheriting
+    from this class overloading the class attributes _vendor and _product as
+    well as all incompatible methods (netconf, ...).
+
+    Subclasses must not add new methods just overload to support vendor or
+    product change using the update method.
+    """
+    _vendor = "juniper"
+    _product = "mx"
+
     # mapping from contrail family names to junos
     _FAMILY_MAP = {
         'route-target': '<route-target/>',
@@ -19,6 +31,15 @@ class PhysicalRouterConfig(object):
         'inet6-vpn': '<inet6-vpn><unicast/></inet6-vpn>',
         'e-vpn': '<evpn><signaling/></evpn>'
     }
+
+    def __new__(cls, management_ip, user_creds, vendor, product, vnc_managed, logger=None):
+        """Constructor assigning right subclass for vendor/product."""
+        for subclass in PhysicalRouterConfig.__subclasses__():
+		    if subclass._vendor == vendor.lower() and subclass._product == product.lower():
+			    return super(cls, subclass).__new__(subclass, management_ip, user_creds, vendor, product, vnc_managed, logger)
+
+        return super(cls, PhysicalRouterConfig).__new__(PhysicalRouterConfig, management_ip, user_creds, vendor, product, vnc_managed, logger)
+
 
     def __init__(self, management_ip, user_creds, vendor, product, vnc_managed, logger=None):
         self.management_ip = management_ip
@@ -37,12 +58,15 @@ class PhysicalRouterConfig(object):
         self.vendor = vendor
         self.product = product
         self.vnc_managed = vnc_managed
+        if vendor != self._vendor or product != self._product:
+            for subclass in PhysicalRouterConfig.__subclasses__():
+    		    if subclass._vendor == vendor.lower() and subclass._product == product.lower():
+    			    self.__class__ = subclass
     # end update
 
-    def send_netconf(self, new_config, default_operation="merge",
-                     operation="replace"):
+    def send_netconf(self, new_config, default_operation="merge", operation="replace"):
         if (self.vendor is None or self.product is None or
-               self.vendor.lower() != "juniper" or self.product.lower() != "mx"):
+               self.vendor.lower() != self._vendor or self.product.lower() != self._product):
             self._logger.info("auto configuraion of physical router is not supported \
                 on the configured vendor family, ip: %s, not pushing netconf message" % (self.management_ip))
             return
@@ -93,9 +117,9 @@ class PhysicalRouterConfig(object):
         etree.SubElement(dynamic_tunnel, "source-address").text = tunnel_source_ip
         etree.SubElement(dynamic_tunnel, "gre")
         if ip_fabric_nets is not None:
-            for subnet in ip_fabric_nets.get("subnet", []): 
+            for subnet in ip_fabric_nets.get("subnet", []):
                 dest_network = etree.SubElement(dynamic_tunnel, "destination-networks")
-                etree.SubElement(dest_network, "name").text = subnet['ip_prefix'] + '/' + str(subnet['ip_prefix_len']) 
+                etree.SubElement(dest_network, "name").text = subnet['ip_prefix'] + '/' + str(subnet['ip_prefix_len'])
         for bgp_router_ip in bgp_router_ips:
             dest_network = etree.SubElement(dynamic_tunnel, "destination-networks")
             etree.SubElement(dest_network, "name").text = bgp_router_ip + '/32'
@@ -180,7 +204,7 @@ class PhysicalRouterConfig(object):
         for route_target in export_targets:
             comm = etree.SubElement(then, "community")
             etree.SubElement(comm, "add")
-            etree.SubElement(comm, "community-name").text = route_target.replace(':', '_') 
+            etree.SubElement(comm, "community-name").text = route_target.replace(':', '_')
         etree.SubElement(then, "accept")
 
         # add policies for import route targets
@@ -276,8 +300,8 @@ class PhysicalRouterConfig(object):
             for interface in interfaces:
                 intf = etree.SubElement(interfaces_config, "interface")
                 intfparts = interface.split(".")
-                etree.SubElement(intf, "name").text = intfparts[0] 
-                etree.SubElement(intf, "encapsulation").text = "ethernet-bridge" 
+                etree.SubElement(intf, "name").text = intfparts[0]
+                etree.SubElement(intf, "encapsulation").text = "ethernet-bridge"
                 intf_unit = etree.SubElement(intf, "unit")
                 etree.SubElement(intf_unit, "name").text = intfparts[1]
                 family = etree.SubElement(intf_unit, "family")
@@ -536,3 +560,10 @@ class PhysicalRouterConfig(object):
     # end send_bgp_config
 
 # end PhycalRouterConfig
+
+class AluXrsConfig(PhysicalRouterConfig):
+    """Subclass for physical router configutation implementing methods for
+    Alcatel Lucent XRS routers.
+    """
+    _vendor = "alcatel"
+    _product = "xrs"
