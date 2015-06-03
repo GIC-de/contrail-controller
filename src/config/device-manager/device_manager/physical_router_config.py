@@ -1,15 +1,14 @@
 #
-# Copyright (c) 2014 Juniper Networks, Inc. All rights reserved.
+# Copyright (c) 2015 Juniper Networks, Inc. All rights reserved.
 #
 """
 This file contains implementation of inetconf interface for physical router
-configuration manager
+configuration manager.
 """
 
 from lxml import etree
 from ncclient import manager
 import copy
-import re
 
 class PhysicalRouterConfig(object):
     """Parent class for physical router configutation implementing methods for
@@ -73,6 +72,7 @@ class PhysicalRouterConfig(object):
     			    self.__class__ = subclass
     # end update
 
+
     def _supported(self):
         """Check if vendor and product is supported."""
         if (self.vendor is None or self.product is None or
@@ -89,7 +89,7 @@ class PhysicalRouterConfig(object):
 
     def send_netconf(self, new_config, default_operation="merge", \
         operation="replace"):
-        """Send netconf."""
+        """Edit config via netconf."""
         if not self._supported:
             return
 
@@ -129,6 +129,7 @@ class PhysicalRouterConfig(object):
                                                       e.message))
     # end send_config
 
+
     def add_dynamic_tunnels(self, tunnel_source_ip, ip_fabric_nets, bgp_router_ips):
         """Add dynamic gre tunnel configuration."""
         self.tunnel_config = etree.Element("routing-options")
@@ -146,6 +147,7 @@ class PhysicalRouterConfig(object):
             dest_network = etree.SubElement(dynamic_tunnel, "destination-networks")
             etree.SubElement(dest_network, "name").text = bgp_router_ip + '/32'
     #end add_dynamic_tunnels
+
 
     def add_routing_instance(self, ri_name, import_targets, export_targets, \
         prefixes=[], gateways=[], router_external=False, interfaces=[], \
@@ -413,6 +415,7 @@ class PhysicalRouterConfig(object):
         self.ri_config = ri_config
     # end add_routing_instance
 
+
     def is_family_configured(self, params, family_name):
         if params is None or params.get('address_families') is None:
             return False
@@ -420,6 +423,7 @@ class PhysicalRouterConfig(object):
         if family_name in families:
             return True
         return False
+
 
     def _add_family_etree(self, parent, params):
         if params.get('address_families') is None:
@@ -433,12 +437,15 @@ class PhysicalRouterConfig(object):
                 etree.SubElement(family_etree, family)
     # end _add_family_etree
 
+
     def add_bgp_auth_config(self, bgp_config, bgp_params):
         if bgp_params.get('auth_data') is None:
             return
         keys = bgp_params['auth_data'].get('key_items', [])
         if len(keys) > 0:
             etree.SubElement(bgp_config, "authentication-key").text = keys[0].get('key')
+    # end add_bgp_auth_config
+
 
     def add_bgp_hold_time_config(self, bgp_config, bgp_params):
         if bgp_params.get('hold_time') is None:
@@ -457,6 +464,7 @@ class PhysicalRouterConfig(object):
                 return
             return
     # end set_bgp_config
+
 
     def _get_bgp_config_xml(self, external=False):
         if self.bgp_params is None:
@@ -478,6 +486,7 @@ class PhysicalRouterConfig(object):
         return bgp_config
     # end _get_bgp_config_xml
 
+
     def reset_bgp_config(self):
         self.routing_instances = {}
         self.bgp_params = None
@@ -494,6 +503,7 @@ class PhysicalRouterConfig(object):
         self.external_peers = {}
     # end reset_bgp_config
 
+
     def delete_bgp_config(self):
         if not self.bgp_config_sent:
             return
@@ -501,6 +511,7 @@ class PhysicalRouterConfig(object):
         self.send_netconf([], default_operation="none", operation="delete")
         self.bgp_config_sent = False
     # end delete_config
+
 
     def add_bgp_peer(self, router, params, external):
         if external:
@@ -520,6 +531,7 @@ class PhysicalRouterConfig(object):
         self.send_bgp_config()
     # end delete_bgp_peer
 
+
     def _get_neighbor_config_xml(self, bgp_config, peers):
         for peer, params in peers.items():
             nbr = etree.SubElement(bgp_config, "neighbor")
@@ -538,6 +550,7 @@ class PhysicalRouterConfig(object):
             if params.get('autonomous_system') is not None:
                 etree.SubElement(nbr, "peer-as").text = str(params.get('autonomous_system'))
     # end _get_neighbor_config_xml
+
 
     def send_bgp_config(self):
         bgp_config = self._get_bgp_config_xml()
@@ -582,7 +595,6 @@ class PhysicalRouterConfig(object):
         self.send_netconf(config_list)
         self.bgp_config_sent = True
     # end send_bgp_config
-
 # end PhycalRouterConfig
 
 
@@ -601,8 +613,31 @@ class AluXrsConfig(PhysicalRouterConfig):
         'e-vpn'         : '<evpn>true/evpn>'
     }
 
+
+    def _netconf_edit(self, m, configuration):
+        if self._logger:
+            self._logger.info("\nsend netconf message: %s\n" % \
+                (etree.tostring(add_config, pretty_print=True)))
+
+        m.edit_config(
+            target='running', config=etree.tostring(add_config),
+            test_option='test-then-set',)
+
+
+    def _netconf_get(self, m, path=""):
+        expr = "<config-format-cli-block><cli-info>" + path + \
+               "</cli-info></config-format-cli-block>"
+
+        return m.get_config(source='running', \
+            filter=('subtree', expr)).data_xml
+
+
     def send_netconf(self, new_config, default_operation=None, operation=None):
-        """
+        """Edit config via netconf.
+
+        - get existing configuration
+        - delete removed configurations
+        - add new configuraitons
 
         """
         if not self._supported:
@@ -616,98 +651,162 @@ class AluXrsConfig(PhysicalRouterConfig):
                                  device_params={'name': "alu"}) as m:
                 assert(":validate" in m.server_capabilities)
 
-                add_config = etree.Element(
-                    "config",
-                    nsmap={"xc": "urn:ietf:params:xml:ns:netconf:base:1.0"})
-                config = etree.SubElement(add_config, "configure",
-                    nsmap={"xc": "alcatel"})
+                #
+                # get current configuration
+                #
+                cfg = self._netconf_get(m)
 
-                if isinstance(new_config, list):
-                    for nc in new_config:
-                        config.append(nc)
+
+                #
+                # remove configurations
+                #
+                if operation == 'delete':
+                    # delete all confiugrations
+
                 else:
-                    config.append(new_config)
+                    # delete changed configuraiton
 
-                self._logger.info("\nsend netconf message: %s\n" % \
-                    (etree.tostring(add_config, pretty_print=True)))
-                m.edit_config(
-                    target='running', config=etree.tostring(add_config),
-                    test_option='test-then-set',)
+
+
+                if not operation == 'delete':
+                    #
+                    # add configurations
+                    #
+                    router_config = ""
+                    service_config = ""
+
+                    # router configuration
+                    if self.bgp_params:
+                        family_config = self._create_family_config_xml(self.bgp_params)
+                        auth_config = self._create_auth_config_xml(self.bgp_params)
+                        hold_config = ""
+                        if self.bgp_params.get('hold_time') is not None:
+                            hold_config = "<hold-time>%s</hold-time>" % \
+                                self.bgp_params.get('hold_time')
+
+                        peers_config = self._create_neighbor_config_xml(self.bgp_peers)
+
+                        external_config = ""
+                        if self.external_peers is not None:
+                            external_peers_config = self._create_neighbor_config_xml(self.external_peers)
+                            external_config = """
+                            <group>
+                                <name>__contrail_external__</name>
+                                <type>
+                                    <internal-external>external</internal-external>
+                                </type>
+                                <multihop>
+                                    <ttl-value>255</ttl-value>
+                                </multihop>
+                                {familys}{auth}{hold}{peers}
+                            </group>""".format(familys=family_config,
+                                auth=auth_config, hold=hold_config,
+                                peers=external_peers_config)
+
+                        router_config = """
+                        <router>
+                            <autonomous-system>
+                                <as-number>{as}</as-number>
+                            </autonomous-system>
+                            <bgp>
+                                <group>
+                                    <name>__contrail__</name>
+                                    <type>
+                                        <internal-external>internal</internal-external>
+                                    </type>
+                                    <multihop>
+                                        <ttl-value>255</ttl-value>
+                                    </multihop>
+                                    {familys}{auth}{hold}{peers}
+                                </group>
+                                {external}
+                            </bgp>
+                        </router>""".format(familys=family_config, auth=auth_config,
+                            as=str(self.bgp_params.get('autonomous_system'),
+                            hold=hold_config, peers=peers_config,
+                            external=external_config)
+                    # end of router configuration
+
+                    # service configuration
+                    if self.routing_instances is not None:
+                        service_config = "<service>"
+                        for ri_name in self.routing_instances:
+                            service_config += self._create_ri_config_xml(
+                                ri_name, **self.routing_instances[ri_name])
+                        service_config = "</service>"
+                    # end of service configuration
+
+
+                    add_config = etree.Element(
+                        "config",
+                        nsmap={"xc": "urn:ietf:params:xml:ns:netconf:base:1.0"})
+                    config = etree.SubElement(add_config, "configure",
+                        nsmap={"xc": "alcatel"})
+
+                    if isinstance(new_config, list):
+                        for nc in new_config:
+                            config.append(nc)
+                    else:
+                        config.append(new_config)
+
 
         except Exception as e:
             if self._logger:
                 self._logger.error("Router %s: %s" % (self.management_ip, \
                     e.message))
+
     # end send_config
+
 
     def add_dynamic_tunnels(self, tunnel_source_ip, ip_fabric_nets, bgp_router_ips):
         """Add dynamic gre tunnel configuration."""
-        pass
+        self.tunnel_config = """
+            <auto-bind-tunnel>
+              <resolution-filter>
+                <gre>true</gre>
+              </resolution-filter>
+              <resolution>
+                <disabled-any-filter>filter</disabled-any-filter>
+              </resolution>
+            </auto-bind-tunnel>
+        """
     #end add_dynamic_tunnels
 
 
-    def _get_bgp_config_xml(self, external=False):
-        if self.bgp_params is None:
-            return None
-        bgp_config = etree.Element("group", operation="replace")
+    def _create_family_config_xml(self, attr):
+        config = ""
+        if attr.get('address_families') is not None:
+            config = "<family>"
+            for family in attr['address_families'].get('family', []):
+                if family in self._FAMILY_MAP:
+                    config += self._FAMILY_MAP[family]
 
-        groupname = "__contrail__"
-        grouptype = "internal"
-        if external:
-            groupname = "__contrail_external__"
-            grouptype = "external"
+            config += "</family>"
 
-        etree.SubElement(bgp_config, "name").text = groupname
-        etree.SubElement(etree.SubElement(bgp_config, "type"), \
-            "internal-external").text = grouptype
-
-        etree.SubElement(bgp_config, "multihop")
-        self._add_family_etree(bgp_config, self.bgp_params)
-        self.add_bgp_auth_config(bgp_config, self.bgp_params)
-        self.add_bgp_hold_time_config(bgp_config, self.bgp_params)
-        # etree.SubElement(bgp_config, "keep").text = "all"
-        return bgp_config
-    # end _get_bgp_config_xml
+        return config
+    # end create_family_config_xml
 
 
-    def _add_family_etree(self, parent, params):
-        #
-        # ToDo: compare with exisitng config to support incremental update.
-        #
-        if params.get('address_families') is None:
-            return
-        family_etree = etree.SubElement(parent, "family")
-        for family in params['address_families'].get('family', []):
-            if family in self._FAMILY_MAP:
-                family_subtree = etree.fromstring(self._FAMILY_MAP[family])
-                family_etree.append(family_subtree)
-            else:
-                etree.SubElement(family_etree, family)
-    # end _add_family_etree
+    def _create_auth_config_xml(self, attr):
+        config = ""
+        if attr.get('auth_data') is not None:
+            keys = attr['auth_data'].get('key_items', [])
+            if len(keys) > 0:
+                config = """
+                    <authentication-key>
+                        <authentication-key-hash-key>%s</authentication-key-hash-key>
+                    </authentication-key>""" % keys[0].get('key')
+
+        return config
+    # end create_auth_config_xml
 
 
-    def add_bgp_auth_config(self, bgp_config, bgp_params):
-        if bgp_params.get('auth_data') is None:
-            #
-            # ToDo: compare with exisitng config and create delete object if
-            # required.
-            #
-            return
-        keys = bgp_params['auth_data'].get('key_items', [])
-        if len(keys) > 0:
-            etree.SubElement(etree.SubElement(bgp_config, "authentication-key"), \
-                "authentication-key-hash-key").text = keys[0].get('key')
-    # end add_bgp_auth_config
-
-
-    def _get_neighbor_config_xml(self, bgp_config, peers):
-        #
-        # ToDo: compare with exisitng config and create delete elements if
-        # required.
-        #
+    def _create_neighbor_config_xml(self, peers):
+        config = ""
         for peer, params in peers.items():
-            nbr = etree.SubElement(bgp_config, "neighbor")
-            etree.SubElement(nbr, "ip-address").text = peer
+            family_config = ""
+            auth_config = ""
+            as_config = ""
             bgp_sessions = params.get('session')
             if bgp_sessions:
                 # for now assume only one session
@@ -716,59 +815,78 @@ class AluXrsConfig(PhysicalRouterConfig):
                     # For not, only consider the attribute if bgp-router is
                     # not specified
                     if attr.get('bgp_router') is None:
-                        self._add_family_etree(nbr, attr)
-                        self.add_bgp_auth_config(nbr, attr)
+                        family_config = self._create_family_config_xml(attr)
+                        auth_config = self._create_auth_config_xml(attr)
                         break
             if params.get('autonomous_system') is not None:
-                etree.SubElement(nbr, "peer-as").text = str(params.get('autonomous_system'))
-    # end _get_neighbor_config_xml
+                as_config = "<peer-as>%s</peer-as>" % str(params.get('autonomous_system'))
+
+            config += """
+                <neighbor>
+                    <name>{peer}</name>
+                    {family}
+                    {auth}
+                    {as}
+            """.format(peer=peer, family=family_config, auth=auth_config, as=as_config)
+
+        return config
+    # end _create_neighbor_config_xml
 
 
-    def send_bgp_config(self):
-        bgp_config = self._get_bgp_config_xml()
-        if bgp_config is None:
-            #
-            # ToDo: compare with exisitng config and create delete elements if
-            # required.
-            #
-            return
-        router_config = etree.Element("router")
-        bgp = etree.SubElement(router_config, "bgp")
-        bgp.append(bgp_config)
-        self._get_neighbor_config_xml(bgp_config, self.bgp_peers)
-        if self.external_peers is not None:
-            ext_grp_config = self._get_bgp_config_xml(True)
-            bgp.append(ext_grp_config)
-            self._get_neighbor_config_xml(ext_grp_config, self.external_peers)
+    def _create_ri_config_xml(self, ri_name, import_targets, export_targets,
+        prefixes, gateways, router_external, interfaces, vni, fip_map):
 
-        # ToDo: get corresponding ALU config ...
-        #   etree.SubElement(router_config, "route-distinguisher-id").text = self.bgp_params['identifier']
-        etree.SubElement(etree.SubElement(router_config, "autonomous-system"), \
-            "<as-number").text = str(self.bgp_params.get('autonomous_system'))
+        service_id = 100000
+        try:
+            if ri_name in self._service_ids
+                service_id = self._service_ids[ri_name]
+            else:
+                service_id = max(self._service_ids.values()) + 1
+                self._service_ids[ri_name] = service_id
+        except:
+            self._service_ids[ri_name] = service_id
 
-        config_list = [proto_config, routing_options_config]
-        if self.ri_config is not None:
-            config_list.append(self.ri_config)
-        for route_target in self.route_targets:
-            comm = etree.SubElement(self.policy_config, "community")
-            etree.SubElement(comm, 'name').text = route_target.replace(':', '_')
-            etree.SubElement(comm, 'members').text = route_target
-        if self.tunnel_config is not None:
-            config_list.append(self.tunnel_config)
-        if self.interfaces_config is not None:
-            config_list.append(self.interfaces_config)
-        if self.services_config is not None:
-            config_list.append(self.services_config)
-        if self.policy_config is not None:
-            config_list.append(self.policy_config)
-        if self.firewall_config is not None:
-            config_list.append(self.firewall_config)
-        if self.forwarding_options_config is not None:
-            config_list.append(self.forwarding_options_config)
-        if self.proto_config is not None:
-            config_list.append(self.proto_config)
-        self.send_netconf(config_list)
-        self.bgp_config_sent = True
-    # end send_bgp_config
+        gre_config = ""
+        try:
+            if self.tunnel_config is not None:
+                gre_config = self.tunnel_config
+        except:
+            pass
 
+        config = """
+        <vprn>
+            <service-id>{id}</service-id>
+            <customer>1</customer>
+            <service-name>
+              <service-name>{name}</service-name>
+            </service-name>
+            <description>
+              <description-string>__contrail__</description-string>
+            </description>
+            <route-distinguisher>
+              <rd>{rd}</rd>
+            </route-distinguisher>
+            <vrf-target>
+              <ext-community>{target}</ext-community>
+            </vrf-target>
+            <ecmp>
+              <max-ecmp-routes>2</max-ecmp-routes>
+            </ecmp>
+            {gre}
+            <shutdown>false</shutdown>
+        </vprn>
+        """.format(id=service_id, name=ri_name, rd=)
+
+
+    # end _create_ri_config_xml
 # end AluXrsConfig
+
+
+class AluSrConfig(AluXrsConfig):
+    """Subclass for physical router configutation implementing methods for
+    Alcatel Lucent SR routers.
+    """
+    _vendor = "alcatel"
+    _product = "sr"
+
+# end AluSrConfig
