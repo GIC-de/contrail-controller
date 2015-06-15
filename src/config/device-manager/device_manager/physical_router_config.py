@@ -624,15 +624,7 @@ class AluXrsConfig(PhysicalRouterConfig):
             test_option='test-then-set',)
 
 
-    def _netconf_get(self, m, path=""):
-        expr = "<config-format-cli-block><cli-info>" + path + \
-               "</cli-info></config-format-cli-block>"
-
-        return m.get_config(source='running', \
-            filter=('subtree', expr)).data_xml
-
-
-    def send_netconf(self, new_config, default_operation=None, operation=None):
+    def send_netconf(self, new_config, default_operation="merge", operation=None):
         """Edit config via netconf.
 
         - get existing configuration
@@ -651,44 +643,40 @@ class AluXrsConfig(PhysicalRouterConfig):
                                  device_params={'name': "alu"}) as m:
                 assert(":validate" in m.server_capabilities)
 
-                #
+                delete = True if  operation == 'delete' else False
+
                 # get current configuration
-                #
-                cfg = self._netconf_get(m)
+                cfg = m.get_config(source='running').data_xml
+                cfgXml = etree.fromstring(cfg)
+
+                # variable containing configuration change XML as string
+                router_config = ""
+                service_config = ""
+
+                print "CONFIG:\n==================="
+                print str(cfg)
+                print "==================="
 
 
-                #
-                # remove configurations
-                #
-                if operation == 'delete':
-                    # delete all confiugrations
+                # router configuration
+                if self.bgp_params:
+                    family_config = self._create_family_config_xml(self.bgp_params)
+                    auth_config = self._create_auth_config_xml(self.bgp_params)
+                    hold_config = ""
+                    if self.bgp_params.get('hold_time') is not None:
+                        hold_config = "<hold-time>%s</hold-time>" % \
+                            self.bgp_params.get('hold_time')
 
-                else:
-                    # delete changed configuraiton
+                    peers_config = self._create_neighbor_config_xml(self.bgp_peers, \
+                        cfgXml.find(".//{*}group[{*}name='__contrail__']"))
 
+                    external_config = ""
+                    if self.external_peers is not None:
+                        print "EXTERNAL PEER"
+                        external_peers_config = self._create_neighbor_config_xml(self.external_peers, \
+                            cfgXml.find(".//{*}group[{*}name='__contrail_external__']"))
 
-
-                if not operation == 'delete':
-                    #
-                    # add configurations
-                    #
-                    router_config = ""
-                    service_config = ""
-
-                    # router configuration
-                    if self.bgp_params:
-                        family_config = self._create_family_config_xml(self.bgp_params)
-                        auth_config = self._create_auth_config_xml(self.bgp_params)
-                        hold_config = ""
-                        if self.bgp_params.get('hold_time') is not None:
-                            hold_config = "<hold-time>%s</hold-time>" % \
-                                self.bgp_params.get('hold_time')
-
-                        peers_config = self._create_neighbor_config_xml(self.bgp_peers)
-
-                        external_config = ""
-                        if self.external_peers is not None:
-                            external_peers_config = self._create_neighbor_config_xml(self.external_peers)
+                        if not delete:
                             external_config = """
                             <group>
                                 <name>__contrail_external__</name>
@@ -699,15 +687,27 @@ class AluXrsConfig(PhysicalRouterConfig):
                                     <ttl-value>255</ttl-value>
                                 </multihop>
                                 {familys}{auth}{hold}{peers}
+                                <shutdown operation="merge">false</shutdown>
                             </group>""".format(familys=family_config,
                                 auth=auth_config, hold=hold_config,
                                 peers=external_peers_config)
+                        else:
+                            external_config = """
+                            <group operation="delete">
+                                <name>__contrail_external__</name>
+                                %s
+                                <shutdown operation="merge">true</shutdown>
+                            </group>""" % external_peers_config
 
+
+                    if not delete:
                         router_config = """
                         <router>
                             <autonomous-system>
-                                <as-number>{as}</as-number>
+                                <autonomous-system>{asnumber}</autonomous-system>
                             </autonomous-system>
+                        </router>
+                        <router>
                             <bgp>
                                 <group>
                                     <name>__contrail__</name>
@@ -718,39 +718,57 @@ class AluXrsConfig(PhysicalRouterConfig):
                                         <ttl-value>255</ttl-value>
                                     </multihop>
                                     {familys}{auth}{hold}{peers}
+                                    <shutdown operation="merge">false</shutdown>
                                 </group>
                                 {external}
+                                <shutdown operation="merge">false</shutdown>
                             </bgp>
-                        </router>""".format(familys=family_config, auth=auth_config,
-                            as=str(self.bgp_params.get('autonomous_system'),
+                        </router>""".format(familys=family_config, auth=auth_config, \
+                            asnumber=str(self.bgp_params.get('autonomous_system')),
                             hold=hold_config, peers=peers_config,
                             external=external_config)
-                    # end of router configuration
-
-                    # service configuration
-                    if self.routing_instances is not None:
-                        service_config = "<service>"
-                        for ri_name in self.routing_instances:
-                            service_config += self._create_ri_config_xml(
-                                ri_name, **self.routing_instances[ri_name])
-                        service_config = "</service>"
-                    # end of service configuration
-
-
-                    add_config = etree.Element(
-                        "config",
-                        nsmap={"xc": "urn:ietf:params:xml:ns:netconf:base:1.0"})
-                    config = etree.SubElement(add_config, "configure",
-                        nsmap={"xc": "alcatel"})
-
-                    if isinstance(new_config, list):
-                        for nc in new_config:
-                            config.append(nc)
                     else:
-                        config.append(new_config)
+                        router_config = """
+                        <router>
+                            <bgp>
+                                <group operation="delete">
+                                    <name>__contrail__</name>
+                                    {peers}
+                                </group>
+                                {external}
+                                <shutdown operation="merge">true</shutdown>
+                            </bgp>
+                        </router>""".format(peers=peers_config, external=external_config)
 
+                # end of router configuration
+
+                # service configuration
+                if self.routing_instances is not None:
+                    for ri_name in self.routing_instances:
+                        service_config += self._create_ri_config_xml(
+                            ri_name, **self.routing_instances[ri_name])
+                    if service_config:
+                        service_config = "<service>%s</service>" % service_config
+                # end of service configuration
+
+
+                config_request = """
+                    <config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+                        <configure xmlns="alcatel">
+                            {router}{service}
+                        </configure>
+                    </config>""".format(router=router_config,
+                        service=service_config)
+
+                print "REQUEST:\n==================="
+                print str(config_request)
+                print "==================="
+                m.edit_config(target='running', config=config_request,
+                    test_option='test-then-set',
+                    default_operation=default_operation)
 
         except Exception as e:
+            print str(e)
             if self._logger:
                 self._logger.error("Router %s: %s" % (self.management_ip, \
                     e.message))
@@ -758,18 +776,21 @@ class AluXrsConfig(PhysicalRouterConfig):
     # end send_config
 
 
+    def send_bgp_config(self):
+        pass
+
+
     def add_dynamic_tunnels(self, tunnel_source_ip, ip_fabric_nets, bgp_router_ips):
         """Add dynamic gre tunnel configuration."""
         self.tunnel_config = """
             <auto-bind-tunnel>
-              <resolution-filter>
-                <gre>true</gre>
-              </resolution-filter>
-              <resolution>
-                <disabled-any-filter>filter</disabled-any-filter>
-              </resolution>
-            </auto-bind-tunnel>
-        """
+                <resolution-filter>
+                    <gre>true</gre>
+                </resolution-filter>
+                <resolution>
+                    <disabled-any-filter>filter</disabled-any-filter>
+                </resolution>
+            </auto-bind-tunnel>"""
     #end add_dynamic_tunnels
 
 
@@ -801,8 +822,25 @@ class AluXrsConfig(PhysicalRouterConfig):
     # end create_auth_config_xml
 
 
-    def _create_neighbor_config_xml(self, peers):
+    def _create_neighbor_config_xml(self, peers, cfgXml = None):
         config = ""
+
+        # delete neighbors if not defined in variable peers
+        if cfgXml:
+            print "DEBUG: check delete"
+            for peer in cfgXml.findall('.//{*}neighbor'):
+                neighbor = peer.find('{*}ip-address').text
+                print "DEBUG: check " + neighbor
+                if not neighbor in peers:
+                    print "DEBUG: delete " + neighbor
+                    # delete config
+                    config += """
+                        <neighbor operation="delete">
+                            <ip-address>%s</ip-address>
+                            <shutdown operation="merge">true</shutdown>
+                        </neighbor>""" % neighbor
+
+        # add neighbors defined in peers
         for peer, params in peers.items():
             family_config = ""
             auth_config = ""
@@ -823,11 +861,10 @@ class AluXrsConfig(PhysicalRouterConfig):
 
             config += """
                 <neighbor>
-                    <name>{peer}</name>
-                    {family}
-                    {auth}
-                    {as}
-            """.format(peer=peer, family=family_config, auth=auth_config, as=as_config)
+                    <ip-address>{peer}</ip-address>
+                    {family}{auth}{ascfg}
+                </neighbor>""".format(peer=peer, family=family_config, \
+                    auth=auth_config, ascfg=as_config)
 
         return config
     # end _create_neighbor_config_xml
@@ -838,7 +875,7 @@ class AluXrsConfig(PhysicalRouterConfig):
 
         service_id = 100000
         try:
-            if ri_name in self._service_ids
+            if ri_name in self._service_ids:
                 service_id = self._service_ids[ri_name]
             else:
                 service_id = max(self._service_ids.values()) + 1
@@ -853,31 +890,33 @@ class AluXrsConfig(PhysicalRouterConfig):
         except:
             pass
 
+        rd_id = "1337:%s" % service_id
+
         config = """
         <vprn>
             <service-id>{id}</service-id>
             <customer>1</customer>
             <service-name>
-              <service-name>{name}</service-name>
+                <service-name>{name}</service-name>
             </service-name>
             <description>
-              <description-string>__contrail__</description-string>
+                <description-string>"__contrail__"</description-string>
             </description>
             <route-distinguisher>
-              <rd>{rd}</rd>
+                <rd>{rd}</rd>
             </route-distinguisher>
             <vrf-target>
-              <ext-community>{target}</ext-community>
+                <ext-community>{target}</ext-community>
             </vrf-target>
             <ecmp>
-              <max-ecmp-routes>2</max-ecmp-routes>
+                <max-ecmp-routes>2</max-ecmp-routes>
             </ecmp>
             {gre}
             <shutdown>false</shutdown>
-        </vprn>
-        """.format(id=service_id, name=ri_name, rd=)
+        </vprn>""".format(id=service_id, name=ri_name, rd=rd_id,
+            target=import_targets, gre=gre_config)
 
-
+        return config
     # end _create_ri_config_xml
 # end AluXrsConfig
 
