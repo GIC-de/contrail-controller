@@ -102,6 +102,9 @@ class PhysicalRouterConfig(object):
             self.commit_stats['netconf_enabled'] = False
             self.commit_stats['netconf_enabled_status'] = "netconf auto configuraion is not enabled on this physical router"
             return False
+
+        self.commit_stats['netconf_enabled'] = True
+        self.commit_stats['netconf_enabled_status'] = ''
         return True
 
 
@@ -110,9 +113,6 @@ class PhysicalRouterConfig(object):
         """Edit config via netconf."""
         if not self._supported:
             return
-
-        self.commit_stats['netconf_enabled'] = True
-        self.commit_stats['netconf_enabled_status'] = ''
 
         try:
             with manager.connect(host=self.management_ip, port=22,
@@ -146,17 +146,20 @@ class PhysicalRouterConfig(object):
 
                 self.commit_stats['total_commits_sent_since_up'] += 1
                 start_time = time.time()
-                m.commit()
+                try:
+                    m.commit()
+                except Exception as e:
+                    self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
+                else:
+                    self.commit_stats['commit_status_message'] = 'success'
+
                 end_time = time.time()
-                self.commit_stats['commit_status_message'] = 'success'
                 self.commit_stats['last_commit_time'] = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
                 self.commit_stats['last_commit_duration'] = str(end_time - start_time)
         except Exception as e:
             if self._logger:
                 self._logger.error("Router %s: %s" % (self.management_ip, e.message))
-                self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
-                self.commit_stats['last_commit_time'] = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
-                self.commit_stats['last_commit_duration'] = str(time.time() - start_time)
+
     # end send_config
 
 
@@ -640,17 +643,6 @@ class AluXrsConfig(PhysicalRouterConfig):
         'e-vpn'         : '<evpn>true/evpn>'
     }
 
-
-    def _netconf_edit(self, m, configuration):
-        if self._logger:
-            self._logger.info("\nsend netconf message: %s\n" % \
-                (etree.tostring(add_config, pretty_print=True)))
-
-        m.edit_config(
-            target='running', config=etree.tostring(add_config),
-            test_option='test-then-set',)
-
-
     def send_netconf(self, new_config, default_operation="merge", operation=None):
         """Edit config via netconf.
 
@@ -693,18 +685,18 @@ class AluXrsConfig(PhysicalRouterConfig):
                 external_config = ""
 
                 if self.bgp_params:
-                    family_config = self._create_family_config_xml(self.bgp_params)
-                    auth_config = self._create_auth_config_xml(self.bgp_params)
+                    family_config = self._alu_create_family_config_xml(self.bgp_params)
+                    auth_config = self._alu_create_auth_config_xml(self.bgp_params)
                     if self.bgp_params.get('hold_time') is not None:
                         hold_config = "<hold-time>%s</hold-time>" % \
                             self.bgp_params.get('hold_time')
 
-                peers_config = self._create_neighbor_config_xml(self.bgp_peers, \
+                peers_config = self._alu_create_neighbor_config_xml(self.bgp_peers, \
                     cfgXml.find(".//{*}group[{*}name='__contrail__']"))
 
                 if self.external_peers is not None:
                     print "EXTERNAL PEER"
-                    external_peers_config = self._create_neighbor_config_xml(self.external_peers, \
+                    external_peers_config = self._alu_create_neighbor_config_xml(self.external_peers, \
                         cfgXml.find(".//{*}group[{*}name='__contrail_external__']"))
 
                     if not delete:
@@ -776,7 +768,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 # service configuration
                 if self.routing_instances is not None:
                     for ri_name in self.routing_instances:
-                        service_config += self._create_ri_config_xml(
+                        service_config += self._alu_create_ri_config_xml(
                             ri_name, **self.routing_instances[ri_name])
                     if service_config:
                         service_config = "<service>%s</service>" % service_config
@@ -794,15 +786,25 @@ class AluXrsConfig(PhysicalRouterConfig):
                 print "REQUEST:\n==================="
                 print str(config_request)
                 print "==================="
-                m.edit_config(target='running', config=config_request,
-                    test_option='test-then-set',
-                    default_operation=default_operation)
 
+                self.commit_stats['total_commits_sent_since_up'] += 1
+                start_time = time.time()
+                try:
+                    m.edit_config(target='running', config=config_request,
+                        test_option='test-then-set',
+                        default_operation=default_operation)
+                except Exception as e:
+                    self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
+                else:
+                    self.commit_stats['commit_status_message'] = 'success'
+
+                end_time = time.time()
+                self.commit_stats['last_commit_time'] = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+                self.commit_stats['last_commit_duration'] = str(end_time - start_time)
         except Exception as e:
             print str(e)
             if self._logger:
-                self._logger.error("Router %s: %s" % (self.management_ip, \
-                    e.message))
+                self._logger.error("Router %s: %s" % (self.management_ip, e.message))
 
     # end send_config
 
@@ -811,7 +813,7 @@ class AluXrsConfig(PhysicalRouterConfig):
         pass
 
 
-    def add_dynamic_tunnels(self, tunnel_source_ip, ip_fabric_nets, bgp_router_ips):
+    def _alu_add_dynamic_tunnels(self, tunnel_source_ip, ip_fabric_nets, bgp_router_ips):
         """Add dynamic gre tunnel configuration."""
         self.tunnel_config = """
             <auto-bind-tunnel>
@@ -825,7 +827,7 @@ class AluXrsConfig(PhysicalRouterConfig):
     #end add_dynamic_tunnels
 
 
-    def _create_family_config_xml(self, attr):
+    def _alu_create_family_config_xml(self, attr):
         config = ""
         if attr.get('address_families') is not None:
             config = "<family>"
@@ -839,7 +841,7 @@ class AluXrsConfig(PhysicalRouterConfig):
     # end create_family_config_xml
 
 
-    def _create_auth_config_xml(self, attr):
+    def _alu_create_auth_config_xml(self, attr):
         config = ""
         if attr.get('auth_data') is not None:
             keys = attr['auth_data'].get('key_items', [])
@@ -853,7 +855,7 @@ class AluXrsConfig(PhysicalRouterConfig):
     # end create_auth_config_xml
 
 
-    def _create_neighbor_config_xml(self, peers, cfgXml = None):
+    def _alu_create_neighbor_config_xml(self, peers, cfgXml = None):
         config = ""
 
         # delete neighbors if not defined in variable peers
@@ -881,8 +883,8 @@ class AluXrsConfig(PhysicalRouterConfig):
                     # For not, only consider the attribute if bgp-router is
                     # not specified
                     if attr.get('bgp_router') is None:
-                        family_config = self._create_family_config_xml(attr)
-                        auth_config = self._create_auth_config_xml(attr)
+                        family_config = self._alu_create_family_config_xml(attr)
+                        auth_config = self._alu_create_auth_config_xml(attr)
                         break
             if params.get('autonomous_system') is not None:
                 as_config = "<peer-as>%s</peer-as>" % str(params.get('autonomous_system'))
@@ -898,7 +900,7 @@ class AluXrsConfig(PhysicalRouterConfig):
     # end _create_neighbor_config_xml
 
 
-    def _create_ri_config_xml(self, ri_name, import_targets, export_targets,
+    def _alu_create_ri_config_xml(self, ri_name, import_targets, export_targets,
         prefixes, gateways, router_external, interfaces, vni, fip_map):
 
         service_id = 100000
@@ -928,7 +930,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 <service-name>{name}</service-name>
             </service-name>
             <description>
-                <description-string>"__contrail__"</description-string>
+                <description-string>__contrail__</description-string>
             </description>
             <route-distinguisher>
                 <rd>{rd}</rd>
@@ -947,13 +949,3 @@ class AluXrsConfig(PhysicalRouterConfig):
         return config
     # end _create_ri_config_xml
 # end AluXrsConfig
-
-
-class AluSrConfig(AluXrsConfig):
-    """Subclass for physical router configutation implementing methods for
-    Alcatel Lucent SR routers.
-    """
-    _vendor = "alcatel"
-    _product = "sr"
-
-# end AluSrConfig
