@@ -9,6 +9,8 @@ configuration manager.
 from lxml import etree
 from ncclient import manager
 import copy
+import time
+import datetime
 
 class PhysicalRouterConfig(object):
     """Parent class for physical router configutation implementing methods for
@@ -55,8 +57,20 @@ class PhysicalRouterConfig(object):
         self.vnc_managed = vnc_managed
         self.reset_bgp_config()
         self._logger = logger
+        self.commit_stats = {
+            'netconf_enabled':False,
+            'netconf_enabled_status':'',
+            'last_commit_time': '',
+            'last_commit_duration': '',
+            'commit_status_message': '',
+            'total_commits_sent_since_up': 0,
+        }
         self.bgp_config_sent = False
     # end __init__
+
+    def get_commit_stats(self):
+         return self.commit_stats
+    #end get_commit_stats
 
     def update(self, management_ip, user_creds, vendor, product, vnc_managed):
         """Update."""
@@ -79,10 +93,14 @@ class PhysicalRouterConfig(object):
             self.vendor.lower() != self._vendor or self.product.lower() != self._product):
             self._logger.info("auto configuraion of physical router is not supported \
                 on the configured vendor family, ip: %s, not pushing netconf message" % (self.management_ip))
+            self.commit_stats['netconf_enabled'] = False
+            self.commit_stats['netconf_enabled_status'] = "netconf configuraion is not supported on this vendor/product family"
             return False
         if (self.vnc_managed is None or self.vnc_managed == False):
             self._logger.info("vnc managed property must be set for a physical router to get auto \
                 configured, ip: %s, not pushing netconf message" % (self.management_ip))
+            self.commit_stats['netconf_enabled'] = False
+            self.commit_stats['netconf_enabled_status'] = "netconf auto configuraion is not enabled on this physical router"
             return False
         return True
 
@@ -92,6 +110,9 @@ class PhysicalRouterConfig(object):
         """Edit config via netconf."""
         if not self._supported:
             return
+
+        self.commit_stats['netconf_enabled'] = True
+        self.commit_stats['netconf_enabled_status'] = ''
 
         try:
             with manager.connect(host=self.management_ip, port=22,
@@ -122,11 +143,20 @@ class PhysicalRouterConfig(object):
                     target='candidate', config=etree.tostring(add_config),
                     test_option='test-then-set',
                     default_operation=default_operation)
+
+                self.commit_stats['total_commits_sent_since_up'] += 1
+                start_time = time.time()
                 m.commit()
+                end_time = time.time()
+                self.commit_stats['commit_status_message'] = 'success'
+                self.commit_stats['last_commit_time'] = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+                self.commit_stats['last_commit_duration'] = str(end_time - start_time)
         except Exception as e:
             if self._logger:
-                self._logger.error("Router %s: %s" % (self.management_ip,
-                                                      e.message))
+                self._logger.error("Router %s: %s" % (self.management_ip, e.message))
+                self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
+                self.commit_stats['last_commit_time'] = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
+                self.commit_stats['last_commit_duration'] = str(time.time() - start_time)
     # end send_config
 
 
@@ -149,10 +179,8 @@ class PhysicalRouterConfig(object):
     #end add_dynamic_tunnels
 
 
-    def add_routing_instance(self, ri_name, import_targets, export_targets, \
-        prefixes=[], gateways=[], router_external=False, interfaces=[], \
-        vni=None, fip_map=None):
-        """Add routing instance."""
+    def add_routing_instance(self, ri_name, import_targets, export_targets,
+                             prefixes=[], gateways=[], router_external=False, interfaces=[], vni=None, fip_map=None):
         self.routing_instances[ri_name] = {'import_targets': import_targets,
                                         'export_targets': export_targets,
                                         'prefixes': prefixes,
@@ -166,36 +194,35 @@ class PhysicalRouterConfig(object):
         policy_config = self.policy_config or etree.Element("policy-options")
         ri = etree.SubElement(ri_config, "instance", operation="replace")
         etree.SubElement(ri, "name").text = ri_name
-        if vni is not None:
-            etree.SubElement(ri, "instance-type").text = "virtual-switch"
-        else:
-            etree.SubElement(ri, "instance-type").text = "vrf"
+        ri_opt = None
         if vni is None:
+            etree.SubElement(ri, "instance-type").text = "vrf"
             for interface in interfaces:
                 if_element = etree.SubElement(ri, "interface")
                 etree.SubElement(if_element, "name").text = interface
-        etree.SubElement(ri, "vrf-import").text = ri_name + "-import"
-        etree.SubElement(ri, "vrf-export").text = ri_name + "-export"
-        if vni is None:
+            etree.SubElement(ri, "vrf-import").text = ri_name + "-import"
+            etree.SubElement(ri, "vrf-export").text = ri_name + "-export"
             etree.SubElement(ri, "vrf-table-label")
-        ri_opt = None
-        if prefixes and vni is None:
-            ri_opt = etree.SubElement(ri, "routing-options")
-            static_config = etree.SubElement(ri_opt, "static")
-            for prefix in prefixes:
-                route_config = etree.SubElement(static_config, "route")
-                etree.SubElement(route_config, "name").text = prefix
-                etree.SubElement(route_config, "discard")
-            auto_export = "<auto-export><family><inet><unicast/></inet></family></auto-export>"
-            ri_opt.append(etree.fromstring(auto_export))
 
-        if router_external and vni is None:
-            if ri_opt is None:
+            if prefixes:
                 ri_opt = etree.SubElement(ri, "routing-options")
                 static_config = etree.SubElement(ri_opt, "static")
-            route_config = etree.SubElement(static_config, "route")
-            etree.SubElement(route_config, "name").text = "0.0.0.0/0"
-            etree.SubElement(route_config, "next-table").text = "inet.0"
+                for prefix in prefixes:
+                    route_config = etree.SubElement(static_config, "route")
+                    etree.SubElement(route_config, "name").text = prefix
+                    etree.SubElement(route_config, "discard")
+                auto_export = "<auto-export><family><inet><unicast/></inet></family></auto-export>"
+                ri_opt.append(etree.fromstring(auto_export))
+
+            if router_external:
+                if ri_opt is None:
+                    ri_opt = etree.SubElement(ri, "routing-options")
+                    static_config = etree.SubElement(ri_opt, "static")
+                route_config = etree.SubElement(static_config, "route")
+                etree.SubElement(route_config, "name").text = "0.0.0.0/0"
+                etree.SubElement(route_config, "next-table").text = "inet.0"
+        else:
+            etree.SubElement(ri, "instance-type").text = "virtual-switch"
 
         if fip_map is not None:
             if ri_opt is None:
@@ -632,6 +659,7 @@ class AluXrsConfig(PhysicalRouterConfig):
         - add new configuraitons
 
         """
+
         if not self._supported:
             return
 
@@ -659,86 +687,89 @@ class AluXrsConfig(PhysicalRouterConfig):
 
 
                 # router configuration
+                family_config = ""
+                auth_config = ""
+                hold_config = ""
+                external_config = ""
+
                 if self.bgp_params:
                     family_config = self._create_family_config_xml(self.bgp_params)
                     auth_config = self._create_auth_config_xml(self.bgp_params)
-                    hold_config = ""
                     if self.bgp_params.get('hold_time') is not None:
                         hold_config = "<hold-time>%s</hold-time>" % \
                             self.bgp_params.get('hold_time')
 
-                    peers_config = self._create_neighbor_config_xml(self.bgp_peers, \
-                        cfgXml.find(".//{*}group[{*}name='__contrail__']"))
+                peers_config = self._create_neighbor_config_xml(self.bgp_peers, \
+                    cfgXml.find(".//{*}group[{*}name='__contrail__']"))
 
-                    external_config = ""
-                    if self.external_peers is not None:
-                        print "EXTERNAL PEER"
-                        external_peers_config = self._create_neighbor_config_xml(self.external_peers, \
-                            cfgXml.find(".//{*}group[{*}name='__contrail_external__']"))
+                if self.external_peers is not None:
+                    print "EXTERNAL PEER"
+                    external_peers_config = self._create_neighbor_config_xml(self.external_peers, \
+                        cfgXml.find(".//{*}group[{*}name='__contrail_external__']"))
 
-                        if not delete:
-                            external_config = """
+                    if not delete:
+                        external_config = """
+                        <group>
+                            <name>__contrail_external__</name>
+                            <type>
+                                <internal-external>external</internal-external>
+                            </type>
+                            <multihop>
+                                <ttl-value>255</ttl-value>
+                            </multihop>
+                            {familys}{auth}{hold}{peers}
+                            <shutdown operation="merge">false</shutdown>
+                        </group>""".format(familys=family_config,
+                            auth=auth_config, hold=hold_config,
+                            peers=external_peers_config)
+                    else:
+                        external_config = """
+                        <group operation="delete">
+                            <name>__contrail_external__</name>
+                            %s
+                            <shutdown operation="merge">true</shutdown>
+                        </group>""" % external_peers_config
+
+                if not delete:
+                    router_config = """
+                    <router>
+                        <autonomous-system>
+                            <autonomous-system>{asnumber}</autonomous-system>
+                        </autonomous-system>
+                    </router>
+                    <router>
+                        <bgp>
                             <group>
-                                <name>__contrail_external__</name>
+                                <name>__contrail__</name>
                                 <type>
-                                    <internal-external>external</internal-external>
+                                    <internal-external>internal</internal-external>
                                 </type>
                                 <multihop>
                                     <ttl-value>255</ttl-value>
                                 </multihop>
                                 {familys}{auth}{hold}{peers}
                                 <shutdown operation="merge">false</shutdown>
-                            </group>""".format(familys=family_config,
-                                auth=auth_config, hold=hold_config,
-                                peers=external_peers_config)
-                        else:
-                            external_config = """
+                            </group>
+                            {external}
+                            <shutdown operation="merge">false</shutdown>
+                        </bgp>
+                    </router>""".format(familys=family_config, auth=auth_config, \
+                        asnumber=str(self.bgp_params.get('autonomous_system')),
+                        hold=hold_config, peers=peers_config,
+                        external=external_config)
+                else:
+                    router_config = """
+                    <router>
+                        <bgp>
                             <group operation="delete">
-                                <name>__contrail_external__</name>
-                                %s
+                                <name>__contrail__</name>
+                                {peers}
                                 <shutdown operation="merge">true</shutdown>
-                            </group>""" % external_peers_config
-
-
-                    if not delete:
-                        router_config = """
-                        <router>
-                            <autonomous-system>
-                                <autonomous-system>{asnumber}</autonomous-system>
-                            </autonomous-system>
-                        </router>
-                        <router>
-                            <bgp>
-                                <group>
-                                    <name>__contrail__</name>
-                                    <type>
-                                        <internal-external>internal</internal-external>
-                                    </type>
-                                    <multihop>
-                                        <ttl-value>255</ttl-value>
-                                    </multihop>
-                                    {familys}{auth}{hold}{peers}
-                                    <shutdown operation="merge">false</shutdown>
-                                </group>
-                                {external}
-                                <shutdown operation="merge">false</shutdown>
-                            </bgp>
-                        </router>""".format(familys=family_config, auth=auth_config, \
-                            asnumber=str(self.bgp_params.get('autonomous_system')),
-                            hold=hold_config, peers=peers_config,
-                            external=external_config)
-                    else:
-                        router_config = """
-                        <router>
-                            <bgp>
-                                <group operation="delete">
-                                    <name>__contrail__</name>
-                                    {peers}
-                                </group>
-                                {external}
-                                <shutdown operation="merge">true</shutdown>
-                            </bgp>
-                        </router>""".format(peers=peers_config, external=external_config)
+                            </group>
+                            {external}
+                            <shutdown operation="merge">true</shutdown>
+                        </bgp>
+                    </router>""".format(peers=peers_config, external=external_config)
 
                 # end of router configuration
 
@@ -827,12 +858,9 @@ class AluXrsConfig(PhysicalRouterConfig):
 
         # delete neighbors if not defined in variable peers
         if cfgXml:
-            print "DEBUG: check delete"
             for peer in cfgXml.findall('.//{*}neighbor'):
                 neighbor = peer.find('{*}ip-address').text
-                print "DEBUG: check " + neighbor
                 if not neighbor in peers:
-                    print "DEBUG: delete " + neighbor
                     # delete config
                     config += """
                         <neighbor operation="delete">
