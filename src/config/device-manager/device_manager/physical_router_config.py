@@ -34,6 +34,7 @@ class PhysicalRouterConfig(object):
         'e-vpn': '<evpn><signaling/></evpn>'
     }
 
+
     def __new__(cls, management_ip, user_creds, vendor, product, vnc_managed, \
         logger=None):
         """Constructor assigning right subclass for vendor/product."""
@@ -68,9 +69,11 @@ class PhysicalRouterConfig(object):
         self.bgp_config_sent = False
     # end __init__
 
+
     def get_commit_stats(self):
          return self.commit_stats
     #end get_commit_stats
+
 
     def update(self, management_ip, user_creds, vendor, product, vnc_managed):
         """Update."""
@@ -106,12 +109,14 @@ class PhysicalRouterConfig(object):
         self.commit_stats['netconf_enabled'] = True
         self.commit_stats['netconf_enabled_status'] = ''
         return True
+    # end _supported
 
 
     def send_netconf(self, new_config, default_operation="merge", \
         operation="replace"):
         """Edit config via netconf."""
-        if not self._supported:
+
+        if not self._supported():
             return
 
         try:
@@ -159,7 +164,6 @@ class PhysicalRouterConfig(object):
         except Exception as e:
             if self._logger:
                 self._logger.error("Router %s: %s" % (self.management_ip, e.message))
-
     # end send_config
 
 
@@ -646,10 +650,8 @@ class AluXrsConfig(PhysicalRouterConfig):
     def send_netconf(self, new_config, default_operation="merge", operation=None):
         """Edit config via netconf.
 
-        - get existing configuration
-        - delete removed configurations
-        - add new configuraitons
-
+        Get existing configuration and create required configuraion patch
+        (add/delete/shutdown...) based on the current attributes.
         """
 
         if not self._supported:
@@ -673,11 +675,6 @@ class AluXrsConfig(PhysicalRouterConfig):
                 router_config = ""
                 service_config = ""
 
-                print "CONFIG:\n==================="
-                print str(cfg)
-                print "==================="
-
-
                 # router configuration
                 family_config = ""
                 auth_config = ""
@@ -688,8 +685,10 @@ class AluXrsConfig(PhysicalRouterConfig):
                     family_config = self._alu_create_family_config_xml(self.bgp_params)
                     auth_config = self._alu_create_auth_config_xml(self.bgp_params)
                     if self.bgp_params.get('hold_time') is not None:
-                        hold_config = "<hold-time>%s</hold-time>" % \
-                            self.bgp_params.get('hold_time')
+                        hold_config = """
+                            <hold-time>
+                                <seconds>%s</seconds>
+                            </hold-time>""" % self.bgp_params.get('hold_time')
 
                 peers_config = self._alu_create_neighbor_config_xml(self.bgp_peers, \
                     cfgXml.find(".//{*}group[{*}name='__contrail__']"))
@@ -709,7 +708,10 @@ class AluXrsConfig(PhysicalRouterConfig):
                             <multihop>
                                 <ttl-value>255</ttl-value>
                             </multihop>
-                            {familys}{auth}{hold}{peers}
+                            {familys}
+                            {auth}
+                            {hold}
+                            {peers}
                             <shutdown operation="merge">false</shutdown>
                         </group>""".format(familys=family_config,
                             auth=auth_config, hold=hold_config,
@@ -739,7 +741,10 @@ class AluXrsConfig(PhysicalRouterConfig):
                                 <multihop>
                                     <ttl-value>255</ttl-value>
                                 </multihop>
-                                {familys}{auth}{hold}{peers}
+                                {familys}
+                                {auth}
+                                {hold}
+                                {peers}
                                 <shutdown operation="merge">false</shutdown>
                             </group>
                             {external}
@@ -774,18 +779,10 @@ class AluXrsConfig(PhysicalRouterConfig):
                         service_config = "<service>%s</service>" % service_config
                 # end of service configuration
 
-
                 config_request = """
                     <config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
-                        <configure xmlns="alcatel">
-                            {router}{service}
-                        </configure>
-                    </config>""".format(router=router_config,
-                        service=service_config)
-
-                print "REQUEST:\n==================="
-                print str(config_request)
-                print "==================="
+                        <configure xmlns="alcatel">%s%s</configure>
+                    </config>""" % (router_config, service_config)
 
                 self.commit_stats['total_commits_sent_since_up'] += 1
                 start_time = time.time()
@@ -795,6 +792,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                         default_operation=default_operation)
                 except Exception as e:
                     self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
+                    self._logger.error("Router %s: %s" % (self.management_ip, e.message))
                 else:
                     self.commit_stats['commit_status_message'] = 'success'
 
@@ -805,12 +803,7 @@ class AluXrsConfig(PhysicalRouterConfig):
             print str(e)
             if self._logger:
                 self._logger.error("Router %s: %s" % (self.management_ip, e.message))
-
     # end send_config
-
-
-    def send_bgp_config(self):
-        pass
 
 
     def _alu_add_dynamic_tunnels(self, tunnel_source_ip, ip_fabric_nets, bgp_router_ips):
@@ -893,6 +886,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 <neighbor>
                     <ip-address>{peer}</ip-address>
                     {family}{auth}{ascfg}
+                    <shutdown operation="merge">false</shutdown>
                 </neighbor>""".format(peer=peer, family=family_config, \
                     auth=auth_config, ascfg=as_config)
 
@@ -903,6 +897,11 @@ class AluXrsConfig(PhysicalRouterConfig):
     def _alu_create_ri_config_xml(self, ri_name, import_targets, export_targets,
         prefixes, gateways, router_external, interfaces, vni, fip_map):
 
+        # ToDo: create policy to import/export multiple targets
+
+        # command failed - 'configure service vprn "100000" customer 1
+        # vrf-target  "set([u'target:64512:8000001', u'target:3320:1337'])"'
+
         service_id = 100000
         try:
             if ri_name in self._service_ids:
@@ -911,6 +910,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 service_id = max(self._service_ids.values()) + 1
                 self._service_ids[ri_name] = service_id
         except:
+            self._service_ids = {}
             self._service_ids[ri_name] = service_id
 
         gre_config = ""
@@ -942,9 +942,9 @@ class AluXrsConfig(PhysicalRouterConfig):
                 <max-ecmp-routes>2</max-ecmp-routes>
             </ecmp>
             {gre}
-            <shutdown>false</shutdown>
+            <shutdown operation="merge">false</shutdown>
         </vprn>""".format(id=service_id, name=ri_name, rd=rd_id,
-            target=import_targets, gre=gre_config)
+            target=import_targets.pop(), gre=gre_config)
 
         return config
     # end _create_ri_config_xml
