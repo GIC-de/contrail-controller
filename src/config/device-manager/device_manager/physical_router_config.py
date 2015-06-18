@@ -639,6 +639,10 @@ class AluXrsConfig(PhysicalRouterConfig):
     _vendor = "alcatel"
     _product = "xrs"
 
+    # ALU SR OS service ID range for Contrails
+    _alu_service_id_min = 10000
+    _alu_service_id_max = 20000
+
     # mapping from contrail family names to ALU SR OS
     _FAMILY_MAP = {
         'route-target'  : '<route-target>true</route-target>',
@@ -674,6 +678,67 @@ class AluXrsConfig(PhysicalRouterConfig):
                 # variable containing configuration change XML as string
                 router_config = ""
                 service_config = ""
+
+                # service configuration
+
+                policy_config = ""
+
+                # sync services
+                self._service_ids = range(self._alu_service_id_min, self._alu_service_id_max +1)
+                self._service_map = {}
+
+                _routing_instances = [ x.replace("_", "-") for x in self.routing_instances ]
+
+                for service in cfgXml.findall('.//{*}service/{*}vprn'):
+                    service_id = int(service.find('{*}service-id').text)
+                    if service_id in self._service_ids:
+                        self._service_ids.remove(service_id)
+
+                    if service_id >= self._alu_service_id_min and service_id <= self._alu_service_id_max:
+
+                        service_name = service.find('{*}service-name/{*}service-name')
+                        service_name = service_name.text if service_name is not None else None
+                        service_desc = service.find('{*}description/{*}description-string')
+                        service_desc = service_desc.text if service_desc is not None else None
+
+                        if service_name:
+                            self._service_map[service_name] = service_id
+
+                        if not service_name in _routing_instances:
+                            # delete service
+                            service_config += self._alu_delete_ri_config_xml(service_name, service_id, service)
+                # end of sysn services
+
+                if self.routing_instances is not None:
+                    _communitys = ""
+                    _policys = ""
+
+                    for ri_name, ri_attributes in self.routing_instances.items():
+                        service_config += self._alu_create_ri_config_xml(
+                            ri_name, **ri_attributes)
+
+                        _import = ri_attributes["import_targets"]
+                        _export = ri_attributes["export_targets"]
+                        _communitys += self._alu_create_community_config_xml(self, _import)
+                        _communitys += self._alu_create_community_config_xml(self, _export)
+
+                        service_id = self._service_map[ri_name.replace("_", "-")]
+
+                        _policys += _alu_create_policy_config_xml(cfgXml, service_id, _import)
+                        _policys += _alu_create_policy_config_xml(cfgXml, service_id, _export, True)
+
+                    policy_config = """
+                    <policy-options>
+                        <begin/>
+                        {communitys}
+                        {policys}
+                        <commit>true</commit>
+                    </policy-options>""".format(communitys=_communitys, policys=_policys)
+
+                    if service_config:
+                        service_config = "<service>%s</service>" % service_config
+                # end of service configuration
+
 
                 # router configuration
                 family_config = ""
@@ -732,6 +797,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                         </autonomous-system>
                     </router>
                     <router>
+                        {policys}
                         <bgp>
                             <group>
                                 <name>__contrail__</name>
@@ -753,7 +819,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                     </router>""".format(familys=family_config, auth=auth_config, \
                         asnumber=str(self.bgp_params.get('autonomous_system')),
                         hold=hold_config, peers=peers_config,
-                        external=external_config)
+                        external=external_config, policys=policy_config)
                 else:
                     router_config = """
                     <router>
@@ -764,20 +830,10 @@ class AluXrsConfig(PhysicalRouterConfig):
                                 <shutdown operation="merge">true</shutdown>
                             </group>
                             {external}
-                            <shutdown operation="merge">true</shutdown>
                         </bgp>
                     </router>""".format(peers=peers_config, external=external_config)
 
                 # end of router configuration
-
-                # service configuration
-                if self.routing_instances is not None:
-                    for ri_name in self.routing_instances:
-                        service_config += self._alu_create_ri_config_xml(
-                            ri_name, **self.routing_instances[ri_name])
-                    if service_config:
-                        service_config = "<service>%s</service>" % service_config
-                # end of service configuration
 
                 config_request = """
                     <config xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
@@ -786,13 +842,19 @@ class AluXrsConfig(PhysicalRouterConfig):
 
                 self.commit_stats['total_commits_sent_since_up'] += 1
                 start_time = time.time()
+                if self._logger:
+                    self._logger.info("Router %s: send netconf" % self.management_ip)
+
+                self._logger.error("DEBUG" + str(config_request))
+
                 try:
                     m.edit_config(target='running', config=config_request,
                         test_option='test-then-set',
                         default_operation=default_operation)
                 except Exception as e:
                     self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
-                    self._logger.error("Router %s: %s" % (self.management_ip, e.message))
+                    if self._logger:
+                        self._logger.error("Router %s: %s" % (self.management_ip, e.message))
                 else:
                     self.commit_stats['commit_status_message'] = 'success'
 
@@ -852,7 +914,7 @@ class AluXrsConfig(PhysicalRouterConfig):
         config = ""
 
         # delete neighbors if not defined in variable peers
-        if cfgXml:
+        if cfgXml is not None:
             for peer in cfgXml.findall('.//{*}neighbor'):
                 neighbor = peer.find('{*}ip-address').text
                 if not neighbor in peers:
@@ -893,25 +955,107 @@ class AluXrsConfig(PhysicalRouterConfig):
         return config
     # end _create_neighbor_config_xml
 
+    def _alu_create_policy_config_xml(self, cfgXml, service_id, targets, export = False):
+        """Alactel SR OS - create policy"""
+
+        config = ""
+
+        policy_name = "contrail_service_import_%s" % str(service_id)
+        if export:
+            policy_name += "contrail_service_export_%s" % str(service_id)
+
+        policyXml = cfgXml.find(".//{*}policy-statement[{*}name='%s']" % policy_name)
+
+        entry = 0
+        if targets:
+            config = "<policy-statement>"
+            config += "<name>%s</name>" % policy_name
+
+            for target in targets:
+                entry += 1
+                community = "contrail_%s" % str(target).replace(":", "_")
+
+                config += """
+                    <entry>
+                        <entry-id>{entry}</entry-id>
+                        <from>
+                            <community>
+                                <comm-name>{community}</comm-name>
+                            </community>
+                        </from>
+                        <action>
+                            <action-id>accept</action-id>
+                        </action>
+                    </entry>""".format(entry=entry, comminity=community)
+
+            if policyXml is not None:
+                for entry in policyXml.findall('.//{*}entry'):
+                    eid = int(entry.text)
+                    if eid > entry:
+                        config += """
+                            <entry operation="delete">
+                                <entry-id>%s</entry-id>
+                            </entry>""" % str(eid)
+
+            config += "</policy-statement>"
+        elif policyXml is not None:
+            config = """
+            <policy-statement operation="delete">
+                <name>%s</name>
+            </policy-statement>""" % policy_name
+
+        return config
+    # end _alu_create_policy_config_xml
+
+
+    def _alu_create_community_config_xml(self, targets):
+        """Alactel SR OS - create communitys"""
+
+        config = ""
+        for target in targets:
+            name = "contrail_%s" % str(target).replace(":", "_")
+            config += """
+                <community>
+                    <name>{name}</name>
+                    <members>{target}</members>
+                </community>""".format(name=name, target=target)
+
+        return config
+    # end _alu_create_community_config_xml
+
+
+    def _alu_delete_ri_config_xml(self, service_name, service_id, service):
+        """Alactel SR OS - delete routing-instances
+
+            no service vprn <id> ...
+        """
+        config = """
+        <vprn operation="delete">
+            <service-id>{sid}</service-id>
+            <shutdown operation="merge">true</shutdown>
+        </vprn>""".format(sid=service_id)
+
+        return config
+    # end _alu_delete_ri_config_xml
+
 
     def _alu_create_ri_config_xml(self, ri_name, import_targets, export_targets,
         prefixes, gateways, router_external, interfaces, vni, fip_map):
+        """Alactel SR OS - create routing-instances
 
-        # ToDo: create policy to import/export multiple targets
+            service vprn <id> create customer 1 ...
+        """
 
-        # command failed - 'configure service vprn "100000" customer 1
-        # vrf-target  "set([u'target:64512:8000001', u'target:3320:1337'])"'
+        service_id = None
 
-        service_id = 100000
-        try:
-            if ri_name in self._service_ids:
-                service_id = self._service_ids[ri_name]
-            else:
-                service_id = max(self._service_ids.values()) + 1
-                self._service_ids[ri_name] = service_id
-        except:
-            self._service_ids = {}
-            self._service_ids[ri_name] = service_id
+        # underscores are not supported in SR OS service-names
+        _ri_name = ri_name.replace("_", "-")
+
+        if _ri_name in self._service_map:
+            service_id = self._service_map[_ri_name]
+        else:
+            service_id = self._service_ids.pop(0)
+            self._service_map[_ri_name] = service_id
 
         gre_config = ""
         try:
@@ -920,11 +1064,27 @@ class AluXrsConfig(PhysicalRouterConfig):
         except:
             pass
 
-        rd_id = "1337:%s" % service_id
+        vrf_import = ""
+        vrf_export = ""
+
+        if import_targets:
+            vrf_import = """
+            <vrf-import>
+                <policy-name>contrail_import_service_%s</policy-name>
+            </vrf-import>""" % str(service_id)
+
+        if export_targets:
+            vrf_export = """
+            <vrf-import>
+                <policy-name>contrail_export_service_%s</policy-name>
+            </vrf-import>""" % str(service_id)
+
+        # create unique route-distinguisher
+        rd_id = "%s:%s" % (self.bgp_params['identifier'], service_id)
 
         config = """
         <vprn>
-            <service-id>{id}</service-id>
+            <service-id>{sid}</service-id>
             <customer>1</customer>
             <service-name>
                 <service-name>{name}</service-name>
@@ -935,16 +1095,14 @@ class AluXrsConfig(PhysicalRouterConfig):
             <route-distinguisher>
                 <rd>{rd}</rd>
             </route-distinguisher>
-            <vrf-target>
-                <ext-community>{target}</ext-community>
-            </vrf-target>
+            {vimport}
+            {vexport}
             <ecmp>
                 <max-ecmp-routes>2</max-ecmp-routes>
             </ecmp>
             {gre}
-            <shutdown operation="merge">false</shutdown>
-        </vprn>""".format(id=service_id, name=ri_name, rd=rd_id,
-            target=import_targets.pop(), gre=gre_config)
+        </vprn>""".format(sid=service_id, name=_ri_name, rd=rd_id,
+            vimport=vrf_import,vexport=vrf_export, gre=gre_config)
 
         return config
     # end _create_ri_config_xml
