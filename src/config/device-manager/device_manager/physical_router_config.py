@@ -154,6 +154,8 @@ class PhysicalRouterConfig(object):
                 try:
                     m.commit()
                 except Exception as e:
+                    if self._logger:
+                        self._logger.error("Router %s: %s" % (self.management_ip, e.message))
                     self.commit_stats['commit_status_message'] = 'failed to apply config, router response: ' + e.message
                 else:
                     self.commit_stats['commit_status_message'] = 'success'
