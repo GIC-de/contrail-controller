@@ -11,6 +11,7 @@ from ncclient import manager
 import copy
 import time
 import datetime
+import re
 
 class PhysicalRouterConfig(object):
     """Parent class for physical router configutation implementing methods for
@@ -658,6 +659,11 @@ class AluXrsConfig(PhysicalRouterConfig):
 
         Get existing configuration and create required configuraion patch
         (add/delete/shutdown...) based on the current attributes.
+
+        ToDo:
+
+        - delete unused policys
+        - delete unused communitys
         """
 
         if not self._supported:
@@ -683,8 +689,6 @@ class AluXrsConfig(PhysicalRouterConfig):
 
                 # service configuration
 
-                policy_config = ""
-
                 # sync services
                 self._service_ids = range(self._alu_service_id_min, self._alu_service_id_max +1)
                 self._service_map = {}
@@ -703,44 +707,51 @@ class AluXrsConfig(PhysicalRouterConfig):
                         service_desc = service.find('{*}description/{*}description-string')
                         service_desc = service_desc.text if service_desc is not None else None
 
-                        if service_name:
-                            self._service_map[service_name] = service_id
+                        ri_name = "%s-%s" % (service_name, service_desc)
 
-                        if not service_name in _routing_instances:
+                        if service_name:
+                            self._service_map[ri_name] = service_id
+
+                        if not ri_name in _routing_instances:
                             # delete service
                             service_config += self._alu_delete_ri_config_xml(service_name, service_id, service)
-                # end of sysn services
+                # end of sync services
+
+                policy_config = ""
 
                 if self.routing_instances is not None:
                     _communitys = ""
                     _policys = ""
 
                     for ri_name, ri_attributes in self.routing_instances.items():
+
                         service_config += self._alu_create_ri_config_xml(
                             ri_name, **ri_attributes)
 
                         _import = ri_attributes["import_targets"]
+                        _communitys += self._alu_create_community_config_xml(_import)
+
                         _export = ri_attributes["export_targets"]
-                        _communitys += self._alu_create_community_config_xml(self, _import)
-                        _communitys += self._alu_create_community_config_xml(self, _export)
+                        _communitys += self._alu_create_community_config_xml(_export)
 
                         service_id = self._service_map[ri_name.replace("_", "-")]
 
-                        _policys += _alu_create_policy_config_xml(cfgXml, service_id, _import)
-                        _policys += _alu_create_policy_config_xml(cfgXml, service_id, _export, True)
+                        _policys += self._alu_create_policy_config_xml(cfgXml, service_id, _import)
+                        _policys += self._alu_create_policy_config_xml(cfgXml, service_id, _export, True)
 
-                    policy_config = """
-                    <policy-options>
-                        <begin/>
-                        {communitys}
-                        {policys}
-                        <commit>true</commit>
-                    </policy-options>""".format(communitys=_communitys, policys=_policys)
 
-                    if service_config:
+                    if len(_communitys) + len(_policys) > 0:
+                        policy_config = """
+                        <policy-options>
+                            <begin/>
+                            {communitys}
+                            {policys}
+                            <commit>true</commit>
+                        </policy-options>""".format(communitys=_communitys, policys=_policys)
+
+                    if len(service_config) > 0:
                         service_config = "<service>%s</service>" % service_config
                 # end of service configuration
-
 
                 # router configuration
                 family_config = ""
@@ -761,7 +772,6 @@ class AluXrsConfig(PhysicalRouterConfig):
                     cfgXml.find(".//{*}group[{*}name='__contrail__']"))
 
                 if self.external_peers is not None:
-                    print "EXTERNAL PEER"
                     external_peers_config = self._alu_create_neighbor_config_xml(self.external_peers, \
                         cfgXml.find(".//{*}group[{*}name='__contrail_external__']"))
 
@@ -846,8 +856,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 start_time = time.time()
                 if self._logger:
                     self._logger.info("Router %s: send netconf" % self.management_ip)
-
-                self._logger.error("DEBUG" + str(config_request))
+                    self._logger.error("DEBUG" + str(config_request))
 
                 try:
                     m.edit_config(target='running', config=config_request,
@@ -864,7 +873,6 @@ class AluXrsConfig(PhysicalRouterConfig):
                 self.commit_stats['last_commit_time'] = datetime.datetime.fromtimestamp(end_time).strftime('%Y-%m-%d %H:%M:%S')
                 self.commit_stats['last_commit_duration'] = str(end_time - start_time)
         except Exception as e:
-            print str(e)
             if self._logger:
                 self._logger.error("Router %s: %s" % (self.management_ip, e.message))
     # end send_config
@@ -964,7 +972,7 @@ class AluXrsConfig(PhysicalRouterConfig):
 
         policy_name = "contrail_service_import_%s" % str(service_id)
         if export:
-            policy_name += "contrail_service_export_%s" % str(service_id)
+            policy_name = "contrail_service_export_%s" % str(service_id)
 
         policyXml = cfgXml.find(".//{*}policy-statement[{*}name='%s']" % policy_name)
 
@@ -988,11 +996,12 @@ class AluXrsConfig(PhysicalRouterConfig):
                         <action>
                             <action-id>accept</action-id>
                         </action>
-                    </entry>""".format(entry=entry, comminity=community)
+                    </entry>""".format(entry=entry, community=community)
 
             if policyXml is not None:
-                for entry in policyXml.findall('.//{*}entry'):
-                    eid = int(entry.text)
+                for entryXml in policyXml.findall('.//{*}entry'):
+
+                    eid = int(entryXml.find('.//{*}entry-id').text)
                     if eid > entry:
                         config += """
                             <entry operation="delete">
@@ -1047,17 +1056,21 @@ class AluXrsConfig(PhysicalRouterConfig):
 
             service vprn <id> create customer 1 ...
         """
+        # underscores are not supported in SR OS service-names
+        _ri_key = ri_name.replace("_", "-")
+
+        pattern = re.compile('(__contrail__\w+_[\w-]+)_(.*)')
+
+        _ri = pattern.search(ri_name)
+        _ri_name = _ri.group(1).replace("_", "-")
+        _ri_description = _ri.group(2)
 
         service_id = None
-
-        # underscores are not supported in SR OS service-names
-        _ri_name = ri_name.replace("_", "-")
-
         if _ri_name in self._service_map:
-            service_id = self._service_map[_ri_name]
+            service_id = self._service_map[_ri_key]
         else:
             service_id = self._service_ids.pop(0)
-            self._service_map[_ri_name] = service_id
+            self._service_map[_ri_key] = service_id
 
         gre_config = ""
         try:
@@ -1092,7 +1105,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 <service-name>{name}</service-name>
             </service-name>
             <description>
-                <description-string>__contrail__</description-string>
+                <description-string>{desc}</description-string>
             </description>
             <route-distinguisher>
                 <rd>{rd}</rd>
@@ -1103,8 +1116,8 @@ class AluXrsConfig(PhysicalRouterConfig):
                 <max-ecmp-routes>2</max-ecmp-routes>
             </ecmp>
             {gre}
-        </vprn>""".format(sid=service_id, name=_ri_name, rd=rd_id,
-            vimport=vrf_import,vexport=vrf_export, gre=gre_config)
+        </vprn>""".format(sid=service_id, name=_ri_name, desc=_ri_description,
+            rd=rd_id, vimport=vrf_import,vexport=vrf_export, gre=gre_config)
 
         return config
     # end _create_ri_config_xml
