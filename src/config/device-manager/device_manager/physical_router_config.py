@@ -712,7 +712,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                         if service_name:
                             self._service_map[ri_name] = service_id
 
-                        if not ri_name in _routing_instances:
+                        if service_name and service_desc and not ri_name in _routing_instances:
                             # delete service
                             service_config += self._alu_delete_ri_config_xml(service_name, service_id, service)
                 # end of sync services
@@ -856,7 +856,7 @@ class AluXrsConfig(PhysicalRouterConfig):
                 start_time = time.time()
                 if self._logger:
                     self._logger.info("Router %s: send netconf" % self.management_ip)
-                    self._logger.error("DEBUG" + str(config_request))
+                    #self._logger.error("DEBUG" + str(config_request))
 
                 try:
                     m.edit_config(target='running', config=config_request,
@@ -1066,7 +1066,7 @@ class AluXrsConfig(PhysicalRouterConfig):
         _ri_description = _ri.group(2)
 
         service_id = None
-        if _ri_name in self._service_map:
+        if _ri_key in self._service_map:
             service_id = self._service_map[_ri_key]
         else:
             service_id = self._service_ids.pop(0)
