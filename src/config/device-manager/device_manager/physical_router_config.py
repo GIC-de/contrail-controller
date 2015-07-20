@@ -661,9 +661,8 @@ class AluXrsConfig(PhysicalRouterConfig):
         (add/delete/shutdown...) based on the current attributes.
 
         ToDo:
-
-        - delete unused policys
-        - delete unused communitys
+            - delete unused policys
+            - delete unused communitys
         """
 
         if not self._supported:
