@@ -1025,9 +1025,9 @@ class AluXrsConfig(PhysicalRouterConfig):
 
         config = ""
 
-        policy_name = "contrail_service_import_%s" % str(service_id)
+        policy_name = "contrail_import_service_%s" % str(service_id)
         if export:
-            policy_name = "contrail_service_export_%s" % str(service_id)
+            policy_name = "contrail_export_service_%s" % str(service_id)
 
         policyXml = cfgXml.find(".//{*}policy-statement[{*}name='%s']" % policy_name)
 
@@ -1036,32 +1036,52 @@ class AluXrsConfig(PhysicalRouterConfig):
             config = "<policy-statement>"
             config += "<name>%s</name>" % policy_name
 
-            for target in targets:
-                entry += 1
-                community = "contrail_%s" % str(target).replace(":", "_")
+            if export:
+                # export all routes and add contrail communitys
+                communitys = ""
+                for target in targets:
+                    communitys += "<add>contrail_%s</add>" % str(target).replace(":", "_")
 
                 config += """
                     <entry>
-                        <entry-id>{entry}</entry-id>
+                        <entry-id>1</entry-id>
                         <from>
-                            <community>
-                                <comm-name>{community}</comm-name>
-                            </community>
                         </from>
                         <action>
                             <action-id>accept</action-id>
+                            <community>
+                                {communitys}
+                            </community>
                         </action>
-                    </entry>""".format(entry=entry, community=community)
+                    </entry>""".format(communitys=communitys)
+            else:
+                # import based on contrail communitys
+                for target in targets:
+                    entry += 1
+                    community = "contrail_%s" % str(target).replace(":", "_")
 
-            if policyXml is not None:
-                for entryXml in policyXml.findall('.//{*}entry'):
+                    config += """
+                        <entry>
+                            <entry-id>{entry}</entry-id>
+                            <from>
+                                <community>
+                                    <comm-name>{community}</comm-name>
+                                </community>
+                            </from>
+                            <action>
+                                <action-id>accept</action-id>
+                            </action>
+                        </entry>""".format(entry=entry, community=community)
 
-                    eid = int(entryXml.find('.//{*}entry-id').text)
-                    if eid > entry:
-                        config += """
-                            <entry operation="delete">
-                                <entry-id>%s</entry-id>
-                            </entry>""" % str(eid)
+                if policyXml is not None:
+                    for entryXml in policyXml.findall('.//{*}entry'):
+
+                        eid = int(entryXml.find('.//{*}entry-id').text)
+                        if eid > entry:
+                            config += """
+                                <entry operation="delete">
+                                    <entry-id>%s</entry-id>
+                                </entry>""" % str(eid)
 
             config += "</policy-statement>"
         elif policyXml is not None:
